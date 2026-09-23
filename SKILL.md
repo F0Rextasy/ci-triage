@@ -1,6 +1,6 @@
 ---
 name: ci-triage
-description: Classifies a failed CI run -- regression, flaky, infra, dependency, or config -- from the log alone plus local git history. Use when a CI job goes red and someone must decide whether to block the merge, rerun the job, or fix the pipeline. No model, no API, no telemetry: the log never leaves the machine, and exit 1 means only one thing -- a real regression.
+description: Classifies a failed CI run -- regression, flaky, infra, dependency, or config -- from the log alone plus local git history. Use when a CI job goes red and someone must decide whether to block the merge, rerun the job, or fix the pipeline. No model, no API, no telemetry - the log never leaves the machine, and exit 1 means only one thing -- a real regression.
 license: MIT
 compatibility: Requires Python 3.8+ and git (only for the pre-existing check). Runs in Claude Code, Codex, Cursor, and any Agent Skills compatible client.
 metadata:

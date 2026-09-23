@@ -4,7 +4,8 @@
 
 [![tests](https://img.shields.io/github/actions/workflow/status/F0Rextasy/ci-triage/test.yml?branch=master&label=tests&style=flat-square&color=3fb950)](https://github.com/F0Rextasy/ci-triage/actions/workflows/test.yml)
 [![python](https://img.shields.io/badge/python-3.8%2B-3776AB?logo=python&logoColor=white&style=flat-square)](https://www.python.org/)
-[![no LLM](https://img.shields.io/badge/verdicts-no%20LLM-E34C26?style=flat-square)](#what-it-will-never-do)
+[![verdicts](https://img.shields.io/badge/verdicts-deterministic-3fb950?style=flat-square)](#what-it-will-never-do)
+[![skills](https://skills.sh/b/F0Rextasy/ci-triage?style=flat-square)](https://skills.sh/F0Rextasy/ci-triage)
 [![license](https://img.shields.io/badge/license-MIT-3fb950?style=flat-square)](LICENSE)
 
 ![one log, three verdicts](assets/demo.svg)
@@ -18,6 +19,10 @@ The demo above is the same log, three runs: first sighting blocks as a regressio
 ## Quick start
 
 ```bash
+# install the skill into any agent (Claude Code, Codex, Cursor, OpenCode, ...):
+npx skills add F0Rextasy/ci-triage
+
+# or run it directly:
 git clone https://github.com/F0Rextasy/ci-triage
 cd ci-triage
 python scripts/ci-triage failed-job.log --history .ci/triage.json --base origin/main
