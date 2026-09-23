@@ -8,7 +8,7 @@
 [![skills](https://skills.sh/b/F0Rextasy/ci-triage?style=flat-square)](https://skills.sh/F0Rextasy/ci-triage)
 [![license](https://img.shields.io/badge/license-MIT-3fb950?style=flat-square)](LICENSE)
 
-![one log, three verdicts](assets/demo.svg)
+![one log, three verdicts](assets/demo.png)
 
 ## Why this exists
 
