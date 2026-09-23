@@ -1,0 +1,7 @@
+Runner: ubuntu-latest
+$ curl -X POST https://api.registry.example/v2/push
+Error: request timed out after 30s
+Warning: connection reset by peer
+retrying... HTTP/1.1 429 Too Many Requests
+retrying... HTTP/1.1 503 Service Unavailable
+ERROR: job failed: runner terminated after 3600s

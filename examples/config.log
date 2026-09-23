@@ -1,0 +1,4 @@
+$ ./scripts/deploy.sh
+deploy.sh: line 12: ruff: command not found
++ chmod: cannot change permissions of '/srv/secrets': Permission denied
+##[error]Process completed with exit code 127.

@@ -1,0 +1,310 @@
+#!/usr/bin/env python3
+"""ci-triage -- classify a failed CI run without sending it to a model.
+
+Is this a flaky test, an infra blip, a dependency resolution failure, a
+config problem, or a real regression that should block the merge? Every
+answer comes from the log itself (signatures), an optional local history
+(seen this exact failure before?), and git (does the failure sit inside
+your diff?). No API, no model, no telemetry: the log never leaves the
+machine.
+
+Exit codes: 0 not a code regression (retry / ignore / fix elsewhere),
+1 regression found (blocks; warnings too with --strict), 2 usage.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+from dataclasses import dataclass
+
+RULES = {
+    # class: (severity, suggestion)
+    "regression": ("fail",
+        "your change broke this -- fix it before merge"),
+    "pre-existing": ("warn",
+        "the failing code is outside this diff -- already broken on the "
+        "base branch"),
+    "flaky": ("warn",
+        "the same signature failed before -- rerun, then quarantine the test"),
+    "infra": ("warn",
+        "runner/network problem -- rerun the job"),
+    "dependency": ("warn",
+        "resolution failure -- fix the lockfile/registry, not the code"),
+    "config": ("warn",
+        "missing tool, permission, or environment -- fix the pipeline"),
+    "unknown": ("warn",
+        "no pattern matched -- a human has to read the log"),
+}
+
+INFRA_RE = re.compile(
+    r"(?i)(timed? ?out after|connection reset|could not resolve host|"
+    r"getaddrinfo failed|etimedout|econnreset|\b429\b|\b50[23]\b|"
+    r"internal server error|no space left on device|out of memory|"
+    r"oomkill|killed\b.*signal|runner terminated|HTTP/1\.1 5\d\d|"
+    r"TLS handshake timeout|rpc error.*unavailable)")
+DEPENDENCY_RE = re.compile(
+    r"(?i)(could not find a version that satisfies|"
+    r"no matching distribution|err! etarget|eresolve|"
+    r"dependency resolution failed|conflicting dependencies|"
+    r"failed to solve:.*dep|no package found|"
+    r"error: failed to select a version for|lock file.*conflict)")
+CONFIG_RE = re.compile(
+    r"(?i)(command not found|is not recognized as|"
+    r"permission denied.*(chmod|read-only)|"
+    r"missing environment variable|no configuration file found|"
+    r"unable to locate credentials|secret.*not set)")
+CODE_RE = re.compile(
+    r"(?i)(assertionerror|assert.*failed|typeerror:|traceback \(most|"
+    r"compilation failed|type error ts\d+|error\[e\d+\]|"
+    r"syntaxerror|undefined is not a function|"
+    r"\bfailed\b.*\d+ (?:test|example)s?|✗|✘|"
+    r"expected .* to (?:be|equal|contain)|panic:)")
+
+FAILURE_LINE_RE = re.compile(
+    r"(?i)(assert|expected|error|failed|failure|panic|✗|✘|\bfail\b)")
+SOURCE_PATH_RE = re.compile(
+    r"(?:File \"([^\"]+)\"|(?:-->|\bat)\s+([^\s:()]+?\.[A-Za-z0-9]+)"
+    r"|(?<![\w/])((?:[\w.-]+[/\\])+[\w.-]+\.[A-Za-z0-9]+):\d+)")
+SOURCE_EXTS = {".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java",
+               ".rb", ".php", ".c", ".cc", ".cpp", ".h", ".cs", ".kt",
+               ".swift", ".sh", ".sql", ".vue", ".svelte"}
+NOISE_RE = re.compile(r"(?i)(\d+ms|\d+\.\d+s|\b\d{7,40}\b|"
+                      r"\b[0-9a-f]{7,40}\b|https?://\S+|"
+                      r"[\w./\\-]*[/\\][\w.-]+)")
+
+
+@dataclass
+class Finding:
+    klass: str
+    line: int
+    message: str
+
+    @property
+    def severity(self) -> str:
+        return RULES[self.klass][0]
+
+
+def normalize_signature(text):
+    """Stable key for 'same failure': kill churn (durations, shas, paths)."""
+    text = NOISE_RE.sub("#", text.lower())
+    text = re.sub(r"\s+", " ", text).strip(" #")
+    return text[:200]
+
+
+def failure_excerpt(lines):
+    hits = [(i, ln) for i, ln in enumerate(lines)
+            if FAILURE_LINE_RE.search(ln)]
+    if not hits:
+        return ""
+    return " | ".join(ln.strip() for _, ln in hits[:3])
+
+
+def extract_paths(lines, repo):
+    out = []
+    for ln in lines:
+        for match in SOURCE_PATH_RE.finditer(ln):
+            raw = next(g for g in match.groups() if g)
+            raw = raw.replace("\\", "/")
+            if os.path.splitext(raw)[1].lower() not in SOURCE_EXTS:
+                continue
+            # keep paths that resolve inside the repo (absolute or relative)
+            for cand in (os.path.join(repo, raw), raw):
+                if os.path.exists(cand):
+                    rel = os.path.relpath(cand, repo).replace("\\", "/")
+                    if not rel.startswith(".."):
+                        out.append(rel)
+                    break
+    seen, uniq = set(), []
+    for p in out:
+        if p not in seen:
+            seen.add(p)
+            uniq.append(p)
+    return uniq
+
+
+def changed_files(repo, base):
+    """Files changed base...HEAD, or None when git cannot answer."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", repo, "diff", "--name-only", "%s...HEAD" % base],
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return {ln.strip().replace("\\", "/")
+            for ln in proc.stdout.splitlines() if ln.strip()}
+
+
+def load_history(path):
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_history(path, history):
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(history, fh, indent=2, sort_keys=True)
+    except OSError:
+        pass  # history is an optimization, never a gate failure
+
+
+def classify(text, repo=None, base=None, history=None, record=False):
+    """Return (klass, finding, signature). One verdict per log."""
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    excerpt = failure_excerpt(lines)
+    signature = hashlib.sha256(
+        normalize_signature(excerpt).encode()).hexdigest()[:16]
+
+    has_code_marker = bool(CODE_RE.search(text))
+    if not has_code_marker and not excerpt:
+        return "unknown", Finding(
+            "unknown", 1, "no recognizable failure in this log"), signature
+
+    # 1. environment failures: not your code, rerun or fix the pipeline
+    for klass, pattern in (("infra", INFRA_RE),
+                           ("dependency", DEPENDENCY_RE),
+                           ("config", CONFIG_RE)):
+        match = pattern.search(text)
+        if match:
+            line_no = text[:match.start()].count("\n") + 1
+            return klass, Finding(
+                klass, line_no,
+                "matched %s signature: %s" % (klass, match.group(0)[:80])
+            ), signature
+
+    # 2. history: an identical failure was recorded before -> rerun
+    if history is not None and signature in history:
+        prior = history[signature]
+        if record:
+            history[signature] = prior + 1
+        return "flaky", Finding(
+            "flaky", 1,
+            "signature %s already recorded %d time(s)"
+            % (signature, prior)), signature
+    if history is not None and record:
+        history[signature] = 1
+
+    # 3. git: does the failing code even sit inside this diff?
+    if base and repo:
+        changed = changed_files(repo, base)
+        if changed is not None:
+            failing = extract_paths(lines, repo)
+            if failing and not (set(failing) & changed):
+                return "pre-existing", Finding(
+                    "pre-existing", 1,
+                    "failing code (%s) is untouched by %s"
+                    % (", ".join(failing[:3]), base)), signature
+
+    if has_code_marker:
+        return "regression", Finding(
+            "regression", 1,
+            "code-level failure signature in the log"), signature
+    return "unknown", Finding(
+        "unknown", 1, "log has a failure but no recognized pattern"), signature
+
+
+def render_text(klass, finding, signature, counts, strict, color):
+    red, yellow, bold, reset = "", "", "", ""
+    if color:
+        red, yellow, bold, reset = "\033[31m", "\033[33m", "\033[1m", "\033[0m"
+    sev = RULES[klass][0]
+    sev_col = red if sev == "fail" else yellow
+    nw = "%d warning%s" % (counts["warn"], "" if counts["warn"] == 1 else "s")
+    out = ["%sL%-4d %s%-5s%s %-14s %s"
+           % (bold, finding.line, sev_col,
+              "FAIL" if sev == "fail" else "WARN", reset,
+              klass, finding.message),
+           "",
+           "ci-triage: %s (signature %s, %d failing, %s)"
+           % (klass, signature, counts["fail"], nw)]
+    if sev == "fail" or (strict and counts["warn"] > 0):
+        out.append(red + "ci-triage: " + RULES[klass][1] + reset)
+    else:
+        out.append("ci-triage: not a merge blocker; use --strict to fail "
+                   "on warnings too")
+    return "\n".join(out)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        prog="ci-triage",
+        description="Classify a failed CI run -- regression, flaky, infra, "
+                    "dependency, config -- from the log plus local git "
+                    "history. No model, no network. Exit 1 only for a "
+                    "regression (or any warning with --strict).")
+    ap.add_argument("log", nargs="?", metavar="LOG",
+                    help="CI log file; use - or omit when piping")
+    ap.add_argument("--history", metavar="FILE",
+                    help="local JSON history of seen failure signatures "
+                         "(enables flaky detection; updated in place)")
+    ap.add_argument("--base", metavar="REF",
+                    help="base ref for the diff (e.g. origin/main); enables "
+                         "the pre-existing check")
+    ap.add_argument("--repo", default=".", metavar="DIR",
+                    help="git repo for --base (default: .)")
+    ap.add_argument("--strict", action="store_true",
+                    help="fail on warnings too")
+    ap.add_argument("--format", choices=("text", "json"), default="text")
+    ap.add_argument("--no-color", action="store_true", help="disable ANSI colors")
+    args = ap.parse_args(argv)
+
+    if args.log in (None, "-"):
+        if args.log is None and sys.stdin.isatty():
+            ap.error("log file required (or pipe the log to stdin)")
+        text = sys.stdin.read()
+    else:
+        try:
+            with open(args.log, encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+        except OSError as exc:
+            ap.error("cannot read log: %s" % exc)
+
+    history = load_history(args.history) if args.history else None
+    klass, finding, signature = classify(
+        text, repo=args.repo, base=args.base,
+        history=history, record=args.history is not None)
+    if args.history:
+        save_history(args.history, history)
+
+    counts = {"fail": 0, "warn": 0}
+    counts["fail" if RULES[klass][0] == "fail" else "warn"] += 1
+    failing = counts["fail"] > 0 or (args.strict and counts["warn"] > 0)
+
+    if args.format == "json":
+        payload = {
+            "ok": not failing,
+            "class": klass,
+            "signature": signature,
+            "counts": counts,
+            "findings": [
+                {"file": "<log>", "line": finding.line, "rule": klass,
+                 "severity": RULES[klass][0], "message": finding.message,
+                 "suggestion": RULES[klass][1]}
+            ],
+        }
+        json.dump(payload, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+    else:
+        color = (not args.no_color and sys.stdout.isatty()
+                 and not os.environ.get("NO_COLOR"))
+        print(render_text(klass, finding, signature, counts, args.strict,
+                          color))
+    return 1 if failing else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

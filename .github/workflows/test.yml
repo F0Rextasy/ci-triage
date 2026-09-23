@@ -1,0 +1,22 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: contract tests
+        run: python -m unittest discover -s tests -v
+      - name: classify the regression fixture
+        run: |
+          python scripts/ci-triage examples/regression.log --no-color || test $? -eq 1
+          python scripts/ci-triage examples/infra.log --no-color
